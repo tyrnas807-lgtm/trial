@@ -40,7 +40,7 @@ def fetch_recent_posts(username, max_posts=20):
     base_url = "https://instagram-public-bulk-scraper.p.rapidapi.com/v1/user_info_web"
     headers = {
         "x-rapidapi-key": RAPIDAPI_KEY,
-        "x-rapidapi-host": "instagram-public-bulk-scraper.p.rapidapi.com"
+        "x-rapidapi-host": "instagram-scraper2.p.rapidapi.com"
     }
 
     all_items = []
