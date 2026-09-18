@@ -82,7 +82,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # Download up to 10 posts
             for post in posts:
-                if count >= 10:
+                if count >= 3:
                     break
                 
                 L.dirname_pattern = download_folder
@@ -90,7 +90,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 count += 1
                 
                 # Sleep delay between downloads to prevent HTTP 429 rate limits
-                await asyncio.sleep(2.5)
+                await asyncio.sleep(7)
 
             if count == 0:
                 await status_msg.edit_text("No posts found or user has no media.")
