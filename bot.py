@@ -7,7 +7,7 @@ from flask import Flask
 from telegram import Update, InputMediaPhoto, InputMediaVideo
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Configure logging to capture detailed tracebacks
+# Configure logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
@@ -32,90 +32,108 @@ RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY")
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Send me a public Instagram username (e.g., `nasa`), "
-        "and I will fetch the 10 most recent posts for you."
+        "and I will fetch ALL posts for that account."
     )
 
-# 4. Helper Function: Fetch Profile Posts via RapidAPI
-def fetch_instagram_posts(username):
-    url = "https://instagram-public-bulk-scraper.p.rapidapi.com/v1/user_info_web"
+# 4. Helper Function: Fetch ALL Posts across Pages via RapidAPI
+def fetch_all_instagram_posts(username):
+    base_url = "https://instagram-public-bulk-scraper.p.rapidapi.com/v1/user_info_web"
     headers = {
         "x-rapidapi-key": RAPIDAPI_KEY,
         "x-rapidapi-host": "instagram-public-bulk-scraper.p.rapidapi.com"
     }
-    params = {"username": username.strip().lower()}
 
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=15)
-        
-        if response.status_code == 404:
-            return None, "Profile not found or API route invalid."
-        elif response.status_code != 200:
-            return None, f"API Error: {response.status_code} - {response.text}"
+    all_items = []
+    end_cursor = None
+    has_next_page = True
+    page_count = 0
 
-        data = response.json()
-        return data, None
-    except Exception as e:
-        return None, f"Network error: {str(e)}"
+    while has_next_page:
+        params = {"username": username.strip().lower()}
+        if end_cursor:
+            params["max_id"] = end_cursor  # Pass pagination token if available
+
+        try:
+            response = requests.get(base_url, headers=headers, params=params, timeout=20)
+            
+            if response.status_code == 404:
+                return None, "Profile not found or API route invalid."
+            elif response.status_code != 200:
+                return None, f"API Error: {response.status_code} - {response.text}"
+
+            api_data = response.json()
+            page_items = []
+            page_info = {}
+
+            # Extract timeline data across different standard schema formats
+            if isinstance(api_data, dict):
+                data_obj = api_data.get("data", api_data)
+                if isinstance(data_obj, dict):
+                    user_obj = data_obj.get("user", data_obj)
+                    timeline = (
+                        user_obj.get("edge_owner_to_timeline_media") or 
+                        user_obj.get("posts") or 
+                        user_obj.get("timeline") or 
+                        {}
+                    )
+                    
+                    if isinstance(timeline, dict):
+                        page_items = timeline.get("edges", timeline.get("items", []))
+                        page_info = timeline.get("page_info", {})
+                    elif isinstance(timeline, list):
+                        page_items = timeline
+
+            if not page_items:
+                break
+
+            all_items.extend(page_items)
+            page_count += 1
+            print(f"Fetched page {page_count} with {len(page_items)} posts. Total: {len(all_items)}", flush=True)
+
+            # Check pagination cursor for next page
+            has_next_page = page_info.get("has_next_page", False)
+            end_cursor = page_info.get("end_cursor")
+
+            if not end_cursor:
+                has_next_page = False
+
+        except Exception as e:
+            print(f"Error fetching page {page_count + 1}: {str(e)}", flush=True)
+            break
+
+    return all_items, None
 
 # 5. Message Handler
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f"--> RECEIVED MESSAGE: {update.message.text}", flush=True)
 
     username = update.message.text.strip().replace("@", "")
-    status_msg = await update.message.reply_text(f"Fetching posts for @{username}...")
+    status_msg = await update.message.reply_text(f"Fetching all posts for @{username}...")
 
     if not RAPIDAPI_KEY:
         await status_msg.edit_text("Error: RAPIDAPI_KEY environment variable is missing on Render.")
         return
 
-    # Fetch data from RapidAPI
-    api_data, error = fetch_instagram_posts(username)
+    # Fetch all items across pagination
+    all_items, error = fetch_all_instagram_posts(username)
 
     if error:
         await status_msg.edit_text(f"Failed to fetch posts. {error}")
         return
 
-    # Print raw response structure to Render logs for easy debugging
-    print(f"DEBUG API RESPONSE KEYS: {list(api_data.keys()) if isinstance(api_data, dict) else type(api_data)}", flush=True)
+    if not all_items:
+        await status_msg.edit_text("No posts found or account has no public media.")
+        return
+
+    total_count = len(all_items)
+    await status_msg.edit_text(f"Found {total_count} posts. Downloading and uploading to Telegram...")
 
     try:
-        items = []
-
-        # Multi-schema JSON extractor to handle varied RapidAPI response layouts
-        if isinstance(api_data, dict):
-            # Extract underlying data dict if wrapped
-            data_obj = api_data.get("data", api_data)
-            
-            if isinstance(data_obj, dict):
-                user_obj = data_obj.get("user", data_obj)
-                
-                # Check standard GraphQL or REST media array locations
-                timeline = (
-                    user_obj.get("edge_owner_to_timeline_media") or 
-                    user_obj.get("posts") or 
-                    user_obj.get("timeline") or 
-                    {}
-                )
-                
-                if isinstance(timeline, dict):
-                    items = timeline.get("edges", timeline.get("items", []))
-                elif isinstance(timeline, list):
-                    items = timeline
-            elif isinstance(data_obj, list):
-                items = data_obj
-        elif isinstance(api_data, list):
-            items = api_data
-
-        if not items:
-            await status_msg.edit_text("No posts found or user has no recent media.")
-            return
-
-        await status_msg.edit_text("Uploading media to Telegram...")
-
         media_group = []
+        uploaded_count = 0
+
         async with httpx.AsyncClient() as client:
-            for item in items[:10]:  # Cap at 10 items
-                # Support both GraphQL node wrappers and flat post dicts
+            for item in all_items:
                 node = item.get("node", item) if isinstance(item, dict) else {}
                 
                 is_video = node.get("is_video", False)
@@ -124,27 +142,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not media_url:
                     continue
 
-                # Download media payload directly into memory
-                resp = await client.get(media_url)
-                if resp.status_code == 200:
-                    if is_video:
-                        media_group.append(InputMediaVideo(media=resp.content))
-                    else:
-                        media_group.append(InputMediaPhoto(media=resp.content))
+                try:
+                    resp = await client.get(media_url, timeout=10)
+                    if resp.status_code == 200:
+                        if is_video:
+                            media_group.append(InputMediaVideo(media=resp.content))
+                        else:
+                            media_group.append(InputMediaPhoto(media=resp.content))
+                except Exception as dl_err:
+                    print(f"Failed to download media item: {dl_err}", flush=True)
+                    continue
 
-                # Telegram media album batch limit is 10 items
+                # Telegram media groups allow up to 10 items per batch
                 if len(media_group) == 10:
                     await update.message.reply_media_group(media=media_group)
+                    uploaded_count += len(media_group)
                     media_group = []
+                    # Keep status updated for large accounts
+                    await status_msg.edit_text(f"Uploaded {uploaded_count}/{total_count} media items...")
 
+            # Upload remaining media items if any
             if media_group:
                 await update.message.reply_media_group(media=media_group)
+                uploaded_count += len(media_group)
 
-        await status_msg.delete()
+        await status_msg.edit_text(f"Successfully finished uploading {uploaded_count} posts for @{username}!")
 
     except Exception as e:
         logging.error(f"Error processing API response: {str(e)}", exc_info=True)
-        await status_msg.edit_text(f"An error occurred while processing media: {str(e)}")
+        await status_msg.edit_text(f"An error occurred while uploading media: {str(e)}")
 
 # 6. Entry Point
 def main():
