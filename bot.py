@@ -32,11 +32,11 @@ RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY")
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Send me a public Instagram username (e.g., `nasa`), "
-        "and I will fetch ALL posts for that account."
+        "and I will fetch up to 20 of their most recent posts, including all carousel images/videos!"
     )
 
-# 4. Helper Function: Fetch ALL Posts across Pages via RapidAPI
-def fetch_all_instagram_posts(username):
+# 4. Helper Function: Fetch up to 20 Posts via RapidAPI
+def fetch_recent_posts(username, max_posts=20):
     base_url = "https://instagram-public-bulk-scraper.p.rapidapi.com/v1/user_info_web"
     headers = {
         "x-rapidapi-key": RAPIDAPI_KEY,
@@ -46,12 +46,11 @@ def fetch_all_instagram_posts(username):
     all_items = []
     end_cursor = None
     has_next_page = True
-    page_count = 0
 
-    while has_next_page:
+    while has_next_page and len(all_items) < max_posts:
         params = {"username": username.strip().lower()}
         if end_cursor:
-            params["max_id"] = end_cursor  # Pass pagination token if available
+            params["max_id"] = end_cursor
 
         try:
             response = requests.get(base_url, headers=headers, params=params, timeout=20)
@@ -65,7 +64,6 @@ def fetch_all_instagram_posts(username):
             page_items = []
             page_info = {}
 
-            # Extract timeline data across different standard schema formats
             if isinstance(api_data, dict):
                 data_obj = api_data.get("data", api_data)
                 if isinstance(data_obj, dict):
@@ -87,10 +85,8 @@ def fetch_all_instagram_posts(username):
                 break
 
             all_items.extend(page_items)
-            page_count += 1
-            print(f"Fetched page {page_count} with {len(page_items)} posts. Total: {len(all_items)}", flush=True)
 
-            # Check pagination cursor for next page
+            # Check pagination cursor
             has_next_page = page_info.get("has_next_page", False)
             end_cursor = page_info.get("end_cursor")
 
@@ -98,75 +94,99 @@ def fetch_all_instagram_posts(username):
                 has_next_page = False
 
         except Exception as e:
-            print(f"Error fetching page {page_count + 1}: {str(e)}", flush=True)
+            print(f"Error fetching page: {str(e)}", flush=True)
             break
 
-    return all_items, None
+    # Cap strictly at max_posts (20)
+    return all_items[:max_posts], None
+
+# Helper: Extract all media items (including carousels) from a post node
+def extract_media_from_node(node):
+    media_list = []
+    
+    # Check if the post is a carousel (has multiple items)
+    carousel_edges = node.get("edge_sidecar_to_children", {}).get("edges", [])
+    
+    if carousel_edges:
+        for child_edge in carousel_edges:
+            child = child_edge.get("node", child_edge)
+            is_vid = child.get("is_video", False)
+            url = child.get("video_url") or child.get("display_url") or child.get("image_url")
+            if url:
+                media_list.append({"url": url, "is_video": is_vid})
+    else:
+        # Single image or video post
+        is_vid = node.get("is_video", False)
+        url = node.get("video_url") or node.get("display_url") or node.get("image_url")
+        if url:
+            media_list.append({"url": url, "is_video": is_vid})
+
+    return media_list
 
 # 5. Message Handler
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f"--> RECEIVED MESSAGE: {update.message.text}", flush=True)
 
     username = update.message.text.strip().replace("@", "")
-    status_msg = await update.message.reply_text(f"Fetching all posts for @{username}...")
+    status_msg = await update.message.reply_text(f"Fetching recent posts for @{username}...")
 
     if not RAPIDAPI_KEY:
         await status_msg.edit_text("Error: RAPIDAPI_KEY environment variable is missing on Render.")
         return
 
-    # Fetch all items across pagination
-    all_items, error = fetch_all_instagram_posts(username)
+    # Fetch max 20 posts
+    posts, error = fetch_recent_posts(username, max_posts=20)
 
     if error:
         await status_msg.edit_text(f"Failed to fetch posts. {error}")
         return
 
-    if not all_items:
+    if not posts:
         await status_msg.edit_text("No posts found or account has no public media.")
         return
 
-    total_count = len(all_items)
-    await status_msg.edit_text(f"Found {total_count} posts. Downloading and uploading to Telegram...")
+    total_posts = len(posts)
+    await status_msg.edit_text(f"Found {total_posts} posts. Extracting media and carousels...")
 
     try:
         media_group = []
-        uploaded_count = 0
+        uploaded_media_count = 0
 
         async with httpx.AsyncClient() as client:
-            for item in all_items:
+            for idx, item in enumerate(posts, start=1):
                 node = item.get("node", item) if isinstance(item, dict) else {}
                 
-                is_video = node.get("is_video", False)
-                media_url = node.get("video_url") or node.get("display_url") or node.get("image_url")
+                # Extract media items (single or carousel slides)
+                media_items = extract_media_from_node(node)
 
-                if not media_url:
-                    continue
+                for media_info in media_items:
+                    media_url = media_info["url"]
+                    is_video = media_info["is_video"]
 
-                try:
-                    resp = await client.get(media_url, timeout=10)
-                    if resp.status_code == 200:
-                        if is_video:
-                            media_group.append(InputMediaVideo(media=resp.content))
-                        else:
-                            media_group.append(InputMediaPhoto(media=resp.content))
-                except Exception as dl_err:
-                    print(f"Failed to download media item: {dl_err}", flush=True)
-                    continue
+                    try:
+                        resp = await client.get(media_url, timeout=10)
+                        if resp.status_code == 200:
+                            if is_video:
+                                media_group.append(InputMediaVideo(media=resp.content))
+                            else:
+                                media_group.append(InputMediaPhoto(media=resp.content))
+                    except Exception as dl_err:
+                        print(f"Failed to download media item: {dl_err}", flush=True)
+                        continue
 
-                # Telegram media groups allow up to 10 items per batch
-                if len(media_group) == 10:
-                    await update.message.reply_media_group(media=media_group)
-                    uploaded_count += len(media_group)
-                    media_group = []
-                    # Keep status updated for large accounts
-                    await status_msg.edit_text(f"Uploaded {uploaded_count}/{total_count} media items...")
+                    # Telegram media group limit is 10 items per batch
+                    if len(media_group) == 10:
+                        await update.message.reply_media_group(media=media_group)
+                        uploaded_media_count += len(media_group)
+                        media_group = []
+                        await status_msg.edit_text(f"Processed post {idx}/{total_posts}...")
 
-            # Upload remaining media items if any
+            # Upload remaining media items
             if media_group:
                 await update.message.reply_media_group(media=media_group)
-                uploaded_count += len(media_group)
+                uploaded_media_count += len(media_group)
 
-        await status_msg.edit_text(f"Successfully finished uploading {uploaded_count} posts for @{username}!")
+        await status_msg.edit_text(f"Done! Sent {uploaded_media_count} files across {total_posts} posts for @{username}.")
 
     except Exception as e:
         logging.error(f"Error processing API response: {str(e)}", exc_info=True)
