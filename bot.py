@@ -43,8 +43,10 @@ L = instaloader.Instaloader(
 if IG_SESSION_ID:
     L.context._session.cookies.set("sessionid", IG_SESSION_ID, domain=".instagram.com")
     print("Global Instaloader instance initialized with IG_SESSION_ID.", flush=True)
+else:
+    print("Warning: IG_SESSION_ID is not set. Rate limits may occur.", flush=True)
 
-# Lock to ensure only one download happens at a time
+# Lock to ensure only one download process runs at a time
 download_lock = asyncio.Lock()
 
 # 4. Command Handler: /start
@@ -54,7 +56,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "and I will fetch the 10 most recent posts for you."
     )
 
-# 5. Message Handler
+# 5. Message Handler for Username Processing
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f"--> RECEIVED MESSAGE: {update.message.text}", flush=True)
 
@@ -64,7 +66,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status_msg = await update.message.reply_text(f"Queueing request for @{username}...")
 
-    # Wait turn if another download is already running
+    # Acquire lock to prevent parallel Instaloader instances
     async with download_lock:
         await status_msg.edit_text(f"Fetching posts for @{username}...")
 
@@ -82,10 +84,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for post in posts:
                 if count >= 10:
                     break
-                # Download into target folder
+                
                 L.dirname_pattern = download_folder
                 L.download_post(post, target=download_folder)
                 count += 1
+                
+                # Sleep delay between downloads to prevent HTTP 429 rate limits
+                await asyncio.sleep(2.5)
 
             if count == 0:
                 await status_msg.edit_text("No posts found or user has no media.")
@@ -107,6 +112,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         with open(file_path, "rb") as f:
                             media_group.append(InputMediaVideo(media=f.read()))
 
+                    # Telegram media group limit is 10 items
                     if len(media_group) == 10:
                         await update.message.reply_media_group(media=media_group)
                         media_group = []
@@ -116,16 +122,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await status_msg.delete()
 
+        except instaloader.exceptions.ConnectionException as e:
+            if "429" in str(e):
+                await status_msg.edit_text("Instagram is currently rate-limiting requests (HTTP 429). Please wait a few minutes or update your IG_SESSION_ID.")
+            else:
+                await status_msg.edit_text("A connection error occurred while contacting Instagram.")
         except instaloader.exceptions.ProfileNotExistsException:
             await status_msg.edit_text("Error: Profile does not exist.")
         except Exception as e:
             logging.error(f"Error handling request: {e}")
-            await status_msg.edit_text("An error occurred while fetching posts. Instagram rate limits may apply.")
+            await status_msg.edit_text("An unexpected error occurred while fetching posts.")
         finally:
             if os.path.exists(download_folder):
                 shutil.rmtree(download_folder)
 
-# 6. Entry Point
+# 6. Application Entry Point
 def main():
     threading.Thread(target=run_flask, daemon=True).start()
 
