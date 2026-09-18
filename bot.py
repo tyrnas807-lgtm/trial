@@ -35,35 +35,41 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "and I will fetch the 10 most recent posts for you."
     )
 
-# 4. Helper Function: Fetch Profile Posts via RapidAPI
+# 4. Helper Function: Fetch Profile Posts via your specific RapidAPI host
 def fetch_instagram_posts(username):
-    url = "https://instagram-bulk-scraper-latest.p.rapidapi.com/web_profile_posts"
+    # Match host from your working code snippet
+    url = "https://instagram-public-bulk-scraper.p.rapidapi.com/v1/user_info_web"
     headers = {
-        "X-RapidAPI-Key": RAPIDAPI_KEY,
-        "X-RapidAPI-Host": "instagram-bulk-scraper-latest.p.rapidapi.com"
+        "x-rapidapi-key": RAPIDAPI_KEY,
+        "x-rapidapi-host": "instagram-public-bulk-scraper.p.rapidapi.com"
     }
-    params = {"username": username}
+    params = {"username": username.strip().lower()}
 
-    response = requests.get(url, headers=headers, params=params, timeout=15)
-    
-    if response.status_code != 200:
-        return None, f"API Error: {response.status_code}"
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=15)
+        
+        if response.status_code == 404:
+            return None, "Profile not found or API route invalid."
+        elif response.status_code != 200:
+            return None, f"API Error: {response.status_code}"
 
-    data = response.json()
-    return data, None
+        data = response.json()
+        return data, None
+    except Exception as e:
+        return None, f"Network error: {str(e)}"
 
 # 5. Message Handler
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f"--> RECEIVED MESSAGE: {update.message.text}", flush=True)
 
     username = update.message.text.strip().replace("@", "")
-    status_msg = await update.message.reply_text(f"Fetching posts for @{username} via RapidAPI...")
+    status_msg = await update.message.reply_text(f"Fetching posts for @{username}...")
 
     if not RAPIDAPI_KEY:
         await status_msg.edit_text("Error: RAPIDAPI_KEY environment variable is missing on Render.")
         return
 
-    # Fetch data from API
+    # Fetch data from RapidAPI
     api_data, error = fetch_instagram_posts(username)
 
     if error:
@@ -71,9 +77,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        # Extract post items from API JSON structure
-        items = api_data.get("data", {}).get("user", {}).get("edge_owner_to_timeline_media", {}).get("edges", [])
+        # Traverse JSON response structure
+        data_obj = api_data.get("data", {})
         
+        # Check standard timeline media paths
+        user_obj = data_obj.get("user", {}) if "user" in data_obj else data_obj
+        timeline = user_obj.get("edge_owner_to_timeline_media", {})
+        items = timeline.get("edges", [])
+
         if not items:
             await status_msg.edit_text("No posts found or account is private/non-existent.")
             return
@@ -90,7 +101,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not media_url:
                     continue
 
-                # Download media bytes in memory
+                # Download image/video bytes in memory
                 resp = await client.get(media_url)
                 if resp.status_code == 200:
                     if is_video:
@@ -98,7 +109,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     else:
                         media_group.append(InputMediaPhoto(media=resp.content))
 
-                # Telegram accepts up to 10 media items per album
+                # Telegram accepts up to 10 items per album
                 if len(media_group) == 10:
                     await update.message.reply_media_group(media=media_group)
                     media_group = []
@@ -110,7 +121,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logging.error(f"Error processing API response: {e}")
-        await status_msg.edit_text("An error occurred while downloading and sending the media.")
+        await status_msg.edit_text("An error occurred while downloading and sending media.")
 
 # 6. Entry Point
 def main():
