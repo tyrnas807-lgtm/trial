@@ -7,7 +7,7 @@ from flask import Flask
 from telegram import Update, InputMediaPhoto, InputMediaVideo
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Configure logging
+# Configure logging to capture detailed tracebacks
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
@@ -35,9 +35,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "and I will fetch the 10 most recent posts for you."
     )
 
-# 4. Helper Function: Fetch Profile Posts via your specific RapidAPI host
+# 4. Helper Function: Fetch Profile Posts via RapidAPI
 def fetch_instagram_posts(username):
-    # Match host from your working code snippet
     url = "https://instagram-public-bulk-scraper.p.rapidapi.com/v1/user_info_web"
     headers = {
         "x-rapidapi-key": RAPIDAPI_KEY,
@@ -51,7 +50,7 @@ def fetch_instagram_posts(username):
         if response.status_code == 404:
             return None, "Profile not found or API route invalid."
         elif response.status_code != 200:
-            return None, f"API Error: {response.status_code}"
+            return None, f"API Error: {response.status_code} - {response.text}"
 
         data = response.json()
         return data, None
@@ -76,32 +75,56 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"Failed to fetch posts. {error}")
         return
 
+    # Print raw response structure to Render logs for easy debugging
+    print(f"DEBUG API RESPONSE KEYS: {list(api_data.keys()) if isinstance(api_data, dict) else type(api_data)}", flush=True)
+
     try:
-        # Traverse JSON response structure
-        data_obj = api_data.get("data", {})
-        
-        # Check standard timeline media paths
-        user_obj = data_obj.get("user", {}) if "user" in data_obj else data_obj
-        timeline = user_obj.get("edge_owner_to_timeline_media", {})
-        items = timeline.get("edges", [])
+        items = []
+
+        # Multi-schema JSON extractor to handle varied RapidAPI response layouts
+        if isinstance(api_data, dict):
+            # Extract underlying data dict if wrapped
+            data_obj = api_data.get("data", api_data)
+            
+            if isinstance(data_obj, dict):
+                user_obj = data_obj.get("user", data_obj)
+                
+                # Check standard GraphQL or REST media array locations
+                timeline = (
+                    user_obj.get("edge_owner_to_timeline_media") or 
+                    user_obj.get("posts") or 
+                    user_obj.get("timeline") or 
+                    {}
+                )
+                
+                if isinstance(timeline, dict):
+                    items = timeline.get("edges", timeline.get("items", []))
+                elif isinstance(timeline, list):
+                    items = timeline
+            elif isinstance(data_obj, list):
+                items = data_obj
+        elif isinstance(api_data, list):
+            items = api_data
 
         if not items:
-            await status_msg.edit_text("No posts found or account is private/non-existent.")
+            await status_msg.edit_text("No posts found or user has no recent media.")
             return
 
         await status_msg.edit_text("Uploading media to Telegram...")
 
         media_group = []
         async with httpx.AsyncClient() as client:
-            for item in items[:10]:  # Limit to 10 posts
-                node = item.get("node", {})
+            for item in items[:10]:  # Cap at 10 items
+                # Support both GraphQL node wrappers and flat post dicts
+                node = item.get("node", item) if isinstance(item, dict) else {}
+                
                 is_video = node.get("is_video", False)
-                media_url = node.get("video_url") if is_video else node.get("display_url")
+                media_url = node.get("video_url") or node.get("display_url") or node.get("image_url")
 
                 if not media_url:
                     continue
 
-                # Download image/video bytes in memory
+                # Download media payload directly into memory
                 resp = await client.get(media_url)
                 if resp.status_code == 200:
                     if is_video:
@@ -109,7 +132,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     else:
                         media_group.append(InputMediaPhoto(media=resp.content))
 
-                # Telegram accepts up to 10 items per album
+                # Telegram media album batch limit is 10 items
                 if len(media_group) == 10:
                     await update.message.reply_media_group(media=media_group)
                     media_group = []
@@ -120,8 +143,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.delete()
 
     except Exception as e:
-        logging.error(f"Error processing API response: {e}")
-        await status_msg.edit_text("An error occurred while downloading and sending media.")
+        logging.error(f"Error processing API response: {str(e)}", exc_info=True)
+        await status_msg.edit_text(f"An error occurred while processing media: {str(e)}")
 
 # 6. Entry Point
 def main():
