@@ -1,12 +1,11 @@
 import os
-import shutil
 import logging
 import threading
-import asyncio
+import httpx
+import requests
 from flask import Flask
 from telegram import Update, InputMediaPhoto, InputMediaVideo
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-import instaloader
 
 # Configure logging
 logging.basicConfig(
@@ -27,116 +26,93 @@ def run_flask():
 
 # 2. Retrieve Environment Variables
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-IG_SESSION_ID = os.environ.get("IG_SESSION_ID")
+RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY")
 
-# 3. Create SINGLE Global Instaloader Instance & Queue Lock
-L = instaloader.Instaloader(
-    download_pictures=True,
-    download_videos=True,
-    download_video_thumbnails=False,
-    download_geotags=False,
-    download_comments=False,
-    save_metadata=False
-)
-
-# Inject session cookie globally on startup
-if IG_SESSION_ID:
-    L.context._session.cookies.set("sessionid", IG_SESSION_ID, domain=".instagram.com")
-    print("Global Instaloader instance initialized with IG_SESSION_ID.", flush=True)
-else:
-    print("Warning: IG_SESSION_ID is not set. Rate limits may occur.", flush=True)
-
-# Lock to ensure only one download process runs at a time
-download_lock = asyncio.Lock()
-
-# 4. Command Handler: /start
+# 3. Command Handler: /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Send me a public Instagram username (e.g., `nasa`), "
         "and I will fetch the 10 most recent posts for you."
     )
 
-# 5. Message Handler for Username Processing
+# 4. Helper Function: Fetch Profile Posts via RapidAPI
+def fetch_instagram_posts(username):
+    url = "https://instagram-bulk-scraper-latest.p.rapidapi.com/web_profile_posts"
+    headers = {
+        "X-RapidAPI-Key": RAPIDAPI_KEY,
+        "X-RapidAPI-Host": "instagram-bulk-scraper-latest.p.rapidapi.com"
+    }
+    params = {"username": username}
+
+    response = requests.get(url, headers=headers, params=params, timeout=15)
+    
+    if response.status_code != 200:
+        return None, f"API Error: {response.status_code}"
+
+    data = response.json()
+    return data, None
+
+# 5. Message Handler
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f"--> RECEIVED MESSAGE: {update.message.text}", flush=True)
 
     username = update.message.text.strip().replace("@", "")
-    chat_id = update.message.chat_id
-    download_folder = f"/tmp/downloads_{chat_id}"
+    status_msg = await update.message.reply_text(f"Fetching posts for @{username} via RapidAPI...")
 
-    status_msg = await update.message.reply_text(f"Queueing request for @{username}...")
+    if not RAPIDAPI_KEY:
+        await status_msg.edit_text("Error: RAPIDAPI_KEY environment variable is missing on Render.")
+        return
 
-    # Acquire lock to prevent parallel Instaloader instances
-    async with download_lock:
-        await status_msg.edit_text(f"Fetching posts for @{username}...")
+    # Fetch data from API
+    api_data, error = fetch_instagram_posts(username)
 
-        try:
-            profile = instaloader.Profile.from_username(L.context, username)
-            
-            if profile.is_private:
-                await status_msg.edit_text("Error: This Instagram profile is private.")
-                return
+    if error:
+        await status_msg.edit_text(f"Failed to fetch posts. {error}")
+        return
 
-            posts = profile.get_posts()
-            count = 0
+    try:
+        # Extract post items from API JSON structure
+        items = api_data.get("data", {}).get("user", {}).get("edge_owner_to_timeline_media", {}).get("edges", [])
+        
+        if not items:
+            await status_msg.edit_text("No posts found or account is private/non-existent.")
+            return
 
-            # Download up to 10 posts
-            for post in posts:
-                if count >= 3:
-                    break
-                
-                L.dirname_pattern = download_folder
-                L.download_post(post, target=download_folder)
-                count += 1
-                
-                # Sleep delay between downloads to prevent HTTP 429 rate limits
-                await asyncio.sleep(7)
+        await status_msg.edit_text("Uploading media to Telegram...")
 
-            if count == 0:
-                await status_msg.edit_text("No posts found or user has no media.")
-                return
+        media_group = []
+        async with httpx.AsyncClient() as client:
+            for item in items[:10]:  # Limit to 10 posts
+                node = item.get("node", {})
+                is_video = node.get("is_video", False)
+                media_url = node.get("video_url") if is_video else node.get("display_url")
 
-            await status_msg.edit_text("Uploading media to Telegram...")
+                if not media_url:
+                    continue
 
-            # Prepare and send media albums
-            media_group = []
-            
-            for root, _, files in os.walk(download_folder):
-                for file in sorted(files):
-                    file_path = os.path.join(root, file)
-                    
-                    if file.endswith(".jpg") or file.endswith(".png"):
-                        with open(file_path, "rb") as f:
-                            media_group.append(InputMediaPhoto(media=f.read()))
-                    elif file.endswith(".mp4"):
-                        with open(file_path, "rb") as f:
-                            media_group.append(InputMediaVideo(media=f.read()))
+                # Download media bytes in memory
+                resp = await client.get(media_url)
+                if resp.status_code == 200:
+                    if is_video:
+                        media_group.append(InputMediaVideo(media=resp.content))
+                    else:
+                        media_group.append(InputMediaPhoto(media=resp.content))
 
-                    # Telegram media group limit is 10 items
-                    if len(media_group) == 10:
-                        await update.message.reply_media_group(media=media_group)
-                        media_group = []
+                # Telegram accepts up to 10 media items per album
+                if len(media_group) == 10:
+                    await update.message.reply_media_group(media=media_group)
+                    media_group = []
 
             if media_group:
                 await update.message.reply_media_group(media=media_group)
 
-            await status_msg.delete()
+        await status_msg.delete()
 
-        except instaloader.exceptions.ConnectionException as e:
-            if "429" in str(e):
-                await status_msg.edit_text("Instagram is currently rate-limiting requests (HTTP 429). Please wait a few minutes or update your IG_SESSION_ID.")
-            else:
-                await status_msg.edit_text("A connection error occurred while contacting Instagram.")
-        except instaloader.exceptions.ProfileNotExistsException:
-            await status_msg.edit_text("Error: Profile does not exist.")
-        except Exception as e:
-            logging.error(f"Error handling request: {e}")
-            await status_msg.edit_text("An unexpected error occurred while fetching posts.")
-        finally:
-            if os.path.exists(download_folder):
-                shutil.rmtree(download_folder)
+    except Exception as e:
+        logging.error(f"Error processing API response: {e}")
+        await status_msg.edit_text("An error occurred while downloading and sending the media.")
 
-# 6. Application Entry Point
+# 6. Entry Point
 def main():
     threading.Thread(target=run_flask, daemon=True).start()
 
