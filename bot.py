@@ -17,7 +17,7 @@ def run_flask():
     app.run(host="0.0.0.0", port=port)
 
 # --- 2. Telegram Bot Logic ---
-BOT_TOKEN = os.environ.get("8761403491:AAFvipWrn0J2uo6kQG36SgMQF5x0zIF78GU")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Send me a public Instagram username!")
