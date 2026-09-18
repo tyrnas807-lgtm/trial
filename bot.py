@@ -19,7 +19,14 @@ def run_flask():
 # --- 2. Telegram Bot Logic ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ADD THIS PRINT LINE FOR DEBUGGING:
+    print(f"--> RECEIVED MESSAGE: {update.message.text}", flush=True)
+
+    username = update.message.text.strip().replace("@", "")
+    chat_id = update.message.chat_id
+    
+    # ... rest of your code ...
     await update.message.reply_text("Send me a public Instagram username!")
 
 # (Include your instaloader and handle_message code here)
