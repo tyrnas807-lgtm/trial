@@ -13,7 +13,7 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-# 1. Flask Web Server Setup (for Render Health Checks)
+# 1. Flask Web Server for Render Health Checks
 app_web = Flask(__name__)
 
 @app_web.route("/")
@@ -24,19 +24,19 @@ def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app_web.run(host="0.0.0.0", port=port)
 
-# 2. Get Bot Token from Render Environment Variables
+# 2. Retrieve Environment Variables
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
+IG_SESSION_ID = os.environ.get("IG_SESSION_ID")
 
-# 3. DEFINE THE 'start' FUNCTION HERE (Before main)
+# 3. Command Handler: /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Send me a public Instagram username (e.g., `nasa`), "
         "and I will fetch the 10 most recent posts for you."
     )
 
-# 4. DEFINE THE 'handle_message' FUNCTION
+# 4. Message Handler for Username Processing
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Print statement forces output to show immediately in Render logs
     print(f"--> RECEIVED MESSAGE: {update.message.text}", flush=True)
 
     username = update.message.text.strip().replace("@", "")
@@ -46,6 +46,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text(f"Fetching posts for @{username}...")
 
     try:
+        # Initialize Instaloader
         L = instaloader.Instaloader(
             download_pictures=True,
             download_videos=True,
@@ -56,6 +57,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             dirname_pattern=download_folder
         )
 
+        # Inject browser sessionid cookie directly to bypass server login checkpoints
+        if IG_SESSION_ID:
+            L.context._session.cookies.set(
+                "sessionid", 
+                IG_SESSION_ID, 
+                domain=".instagram.com"
+            )
+            print("Successfully injected active IG_SESSION_ID cookie.", flush=True)
+        else:
+            print("Warning: IG_SESSION_ID is not set. Rate limits may occur.", flush=True)
+
         profile = instaloader.Profile.from_username(L.context, username)
         
         if profile.is_private:
@@ -65,6 +77,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         posts = profile.get_posts()
         count = 0
 
+        # Download up to 10 posts
         for post in posts:
             if count >= 10:
                 break
@@ -77,6 +90,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await status_msg.edit_text("Uploading media to Telegram...")
 
+        # Prepare and send media albums
         media_group = []
         
         for root, _, files in os.walk(download_folder):
@@ -90,10 +104,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     with open(file_path, "rb") as f:
                         media_group.append(InputMediaVideo(media=f.read()))
 
+                # Telegram media groups accept max 10 files per batch
                 if len(media_group) == 10:
                     await update.message.reply_media_group(media=media_group)
                     media_group = []
 
+        # Send remaining files if any
         if media_group:
             await update.message.reply_media_group(media=media_group)
 
@@ -103,18 +119,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text("Error: Profile does not exist.")
     except Exception as e:
         logging.error(f"Error handling request: {e}")
-        await status_msg.edit_text("An error occurred while fetching the profile. Instagram rate limits or proxy restrictions may apply.")
+        await status_msg.edit_text("An error occurred while fetching posts. The session may have expired or Instagram rate limits were hit.")
     finally:
+        # Clean up downloaded files from temporary storage
         if os.path.exists(download_folder):
             shutil.rmtree(download_folder)
 
-# 5. MAIN FUNCTION
+# 5. Application Entry Point
 def main():
-    # Run Flask in background thread
+    # Start Flask server thread for Render health checks
     threading.Thread(target=run_flask, daemon=True).start()
 
     if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN environment variable is not set!")
+        raise ValueError("CRITICAL: BOT_TOKEN environment variable is not set!")
 
     application = Application.builder().token(BOT_TOKEN).build()
 
