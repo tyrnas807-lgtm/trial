@@ -1,0 +1,3 @@
+python-telegram-bot[webhooks]>=21
+instaloader>=4.13
+Pillow>=10
